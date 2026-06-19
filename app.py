@@ -1261,6 +1261,10 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/data/"):
+            parsed = parsed._replace(path="/api/" + parsed.path[len("/data/"):])
+            self.handle_api(parsed)
+            return
         if parsed.path.startswith("/api/"):
             self.handle_api(parsed)
             return

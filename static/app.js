@@ -76,7 +76,7 @@ async function fetchJson(url) {
 }
 
 async function loadUniverse() {
-  const data = await fetchJson("/api/universe");
+  const data = await fetchJson("/data/universe");
   $("symbolsInput").value = data.symbols.join(",");
 }
 
@@ -87,7 +87,7 @@ async function screen() {
   $("screenButton").disabled = true;
   try {
     const qs = new URLSearchParams({ symbols, limit, deep_limit: "160" });
-    const data = await fetchJson(`/api/screen?${qs}`);
+    const data = await fetchJson(`/data/screen?${qs}`);
     state.rows = data.rows;
     renderSummary(data);
     updateFilterTabs();
@@ -112,7 +112,7 @@ async function backtest() {
   $("backtestButton").disabled = true;
   try {
     const qs = new URLSearchParams({ symbols, limit, lookback_days: lookbackDays, deep_limit: "160" });
-    const data = await fetchJson(`/api/backtest?${qs}`);
+    const data = await fetchJson(`/data/backtest?${qs}`);
     renderBacktest(data);
     const meta = data.backtest_meta || {};
     setStatus(`回测完成 ${meta.as_of_date || "-"} 至 ${meta.latest_date || "-"}`);
@@ -228,7 +228,7 @@ async function selectSymbol(symbol) {
   setStatus(`读取 ${symbol.toUpperCase()} ${periodLabels[state.period] || `${state.period}分`}明细...`);
   try {
     const qs = new URLSearchParams({ symbol, period: String(state.period) });
-    const data = await fetchJson(`/api/detail?${qs}`);
+    const data = await fetchJson(`/data/detail?${qs}`);
     renderDetail(data);
     setStatus(`明细已刷新 ${periodLabels[state.period] || `${state.period}分`} ${data.intraday.latest_time || ""}`);
   } catch (err) {
