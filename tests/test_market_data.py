@@ -171,6 +171,34 @@ class StrategyTests(unittest.TestCase):
         self.assertGreaterEqual(signal["score"], 55)
         self.assertIn(signal["status"], {"buy_watch", "watch", "avoid"})
         self.assertIn("stop_price", signal)
+        self.assertEqual(signal["score_model"], "steady_swing_v2")
+        self.assertEqual(set(signal["score_breakdown"]), {"technical", "money", "risk", "quality"})
+        self.assertIn("risk_reward_ratio", signal)
+
+    def test_rejuvenation_penalizes_poor_risk_reward(self):
+        points = []
+        price = 10.0
+        for i in range(90):
+            if i < 60:
+                price += 0.06
+            elif i < 78:
+                price -= 0.02
+            else:
+                price += 0.005
+            points.append(
+                {
+                    "time": f"2026-04-{(i % 28) + 1:02d}",
+                    "open": price - 0.02,
+                    "close": price,
+                    "high": price + 0.03,
+                    "low": price - 0.03,
+                    "volume": 120000,
+                    "amount": price * 120000,
+                }
+            )
+        signal = score_rejuvenation(points)
+        self.assertLess(signal["risk_reward_ratio"], 1.5)
+        self.assertNotEqual(signal["status"], "buy_watch")
 
     def test_intraday_confirmation_flags_invalid(self):
         daily_signal = {"stop_price": 9.0, "observe_price": 10.0}

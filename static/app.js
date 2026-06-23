@@ -201,17 +201,22 @@ function renderTable(rows) {
   body.innerHTML = rows
     .map((row) => {
       const changeClass = Number(row.change_pct) >= 0 ? "up" : "down";
+      const parts = row.signal.score_breakdown || {};
+      const scoreTitle =
+        `技术 ${parts.technical ?? 0}/60，资金 ${parts.money ?? 0}/20，` +
+        `风险收益 ${parts.risk ?? 0}/15，流动性 ${parts.quality ?? 0}/5，` +
+        `盈亏比 ${row.signal.risk_reward_ratio ?? "-"}`;
       return `
         <tr data-symbol="${row.symbol}">
           <td>${row.symbol.toUpperCase()}</td>
           <td>${row.name || "-"}</td>
           <td>${formatNumber(row.price)}</td>
           <td class="${changeClass}">${formatNumber(row.change_pct)}%</td>
-          <td><strong>${row.signal.score}</strong></td>
+          <td title="${escapeHtml(scoreTitle)}"><strong>${row.signal.score}</strong></td>
           <td><span class="badge ${row.signal.status}">${statusLabels[row.signal.status] || row.signal.status}</span></td>
           <td>${formatNumber(row.signal.observe_price)}</td>
           <td>${formatNumber(row.signal.stop_price)}</td>
-          <td>${row.signal.reason || "-"}</td>
+          <td>${escapeHtml(row.signal.reason || "-")}</td>
         </tr>`;
     })
     .join("");
