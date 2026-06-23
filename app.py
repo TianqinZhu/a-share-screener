@@ -401,7 +401,16 @@ def get_eastmoney_spot_candidates(page_size: int = 240) -> dict[str, Any]:
 
     by_amount, total = fetch("f6")
     by_momentum, momentum_total = fetch("f3")
-    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_amount + by_momentum}
+    active_pullback = [
+        row
+        for row in by_amount
+        if -3.5 <= (row.get("change_pct") or 0) <= 2.5 and (row.get("amount") or 0) >= 100_000_000
+    ]
+    balanced = sorted(
+        active_pullback,
+        key=lambda row: (abs((row.get("change_pct") or 0) - 0.5), -(row.get("amount") or 0)),
+    )
+    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_amount + balanced + by_momentum}
     result = {
         "rows": list(combined.values()),
         "total": max(total, momentum_total, len(combined)),
@@ -558,7 +567,15 @@ def market_prefilter(rows: list[dict[str, Any]], deep_limit: int, min_amount: fl
         key=lambda row: ((row.get("change_pct") or 0), (row.get("amount") or 0)),
         reverse=True,
     )[:slice_size]
-    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_amount + by_momentum}
+    by_balanced = sorted(
+        filtered,
+        key=lambda row: (
+            0 if -3.5 <= (row.get("change_pct") or 0) <= 2.5 else 1,
+            abs((row.get("change_pct") or 0) - 0.5),
+            -(row.get("amount") or 0),
+        ),
+    )[:slice_size]
+    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_balanced + by_amount + by_momentum}
     return list(combined.values())[:deep_limit]
 
 
@@ -895,12 +912,26 @@ def score_rejuvenation(daily_points: list[dict[str, Any]]) -> dict[str, Any]:
         "risk": int(round(risk_score)),
         "quality": int(round(quality_score)),
     }
-    score = int(max(0, min(100, round(sum(score_breakdown.values())))))
-
     risk_ok = risk_reward_ratio >= 1.2 and chase_risk_ok and stop_risk_pct <= 12
+    raw_score = int(max(0, min(100, round(sum(score_breakdown.values())))))
+    score_cap = 100
+    if risk_reward_ratio <= 0:
+        score_cap = min(score_cap, 48)
+    elif risk_reward_ratio < 0.8:
+        score_cap = min(score_cap, 55)
+    elif risk_reward_ratio < 1.2:
+        score_cap = min(score_cap, 62)
+    if not chase_risk_ok:
+        score_cap = min(score_cap, 60 if distance_to_ma20 > 12 else 68)
+    if stop_risk_pct > 12:
+        score_cap = min(score_cap, 66)
+    if not not_blowoff:
+        score_cap = min(score_cap, 64)
+    score = min(raw_score, score_cap)
+
     if score >= 76 and trend_ok and ma20_support and reclaim_ok and risk_reward_ratio >= 1.5 and chase_risk_ok and not_blowoff:
         status = "buy_watch"
-    elif score >= 62 and above_ma20 and ma20_support and risk_ok:
+    elif score >= 62 and above_ma20 and reclaim_ok and pullback_shrink_ok and risk_ok:
         status = "watch"
     else:
         status = "avoid"
@@ -1236,7 +1267,11 @@ def recommend_market(top: int = 10, deep_limit: int = 40, min_amount: float = 10
         reverse=True,
     )
     fallback = sorted(scored, key=lambda row: row["signal"].get("score", 0), reverse=True)
-    rows = (qualified or fallback)[:top]
+    rows = qualified[:top]
+    if len(rows) < top:
+        used = {row["symbol"] for row in rows}
+        rows.extend(row for row in fallback if row["symbol"] not in used)
+        rows = rows[:top]
     latest_trade_date = ""
     for row in rows:
         latest_trade_date = row["signal"].get("latest_date") or latest_trade_date
@@ -1352,8 +1387,7 @@ def backtest_strategy(
                 errors += 1
 
     qualified = [row for row in scored if row["signal"].get("status") in {"buy_watch", "watch"}]
-    ranked_source = qualified or scored
-    ranked_source.sort(
+    qualified.sort(
         key=lambda row: (
             row["signal"].get("score", 0),
             row.get("max_gain_pct", 0),
@@ -1361,7 +1395,20 @@ def backtest_strategy(
         ),
         reverse=True,
     )
-    rows = ranked_source[:top]
+    fallback = sorted(
+        scored,
+        key=lambda row: (
+            row["signal"].get("score", 0),
+            row.get("max_gain_pct", 0),
+            row.get("return_pct", 0),
+        ),
+        reverse=True,
+    )
+    rows = qualified[:top]
+    if len(rows) < top:
+        used = {row["symbol"] for row in rows}
+        rows.extend(row for row in fallback if row["symbol"] not in used)
+        rows = rows[:top]
     as_of_date = rows[0]["as_of_date"] if rows else ""
     latest_date = rows[0]["latest_date"] if rows else ""
     for rank, row in enumerate(rows, start=1):
