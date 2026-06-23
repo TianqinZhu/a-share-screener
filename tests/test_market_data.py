@@ -14,6 +14,7 @@ from app import (
     summarize_backtest,
     trading_day_index,
 )
+from scripts.backtest_cli import run_rolling_backtest, summarize_rows
 
 
 class MarketDataParsingTests(unittest.TestCase):
@@ -171,34 +172,37 @@ class StrategyTests(unittest.TestCase):
         self.assertGreaterEqual(signal["score"], 55)
         self.assertIn(signal["status"], {"buy_watch", "watch", "avoid"})
         self.assertIn("stop_price", signal)
-        self.assertEqual(signal["score_model"], "steady_swing_v2")
-        self.assertEqual(set(signal["score_breakdown"]), {"technical", "money", "risk", "quality"})
-        self.assertIn("risk_reward_ratio", signal)
+        self.assertNotIn("score_model", signal)
+        self.assertNotIn("score_breakdown", signal)
+        self.assertNotIn("risk_reward_ratio", signal)
 
-    def test_rejuvenation_penalizes_poor_risk_reward(self):
+    def test_rejuvenation_flags_initial_ma20_pullback_setup(self):
         points = []
         price = 10.0
         for i in range(90):
-            if i < 60:
-                price += 0.06
-            elif i < 78:
-                price -= 0.02
+            if i < 45:
+                price += 0.04
+            elif i < 62:
+                price += 0.16
+            elif i < 76:
+                price -= 0.04
             else:
-                price += 0.005
+                price += 0.08
             points.append(
                 {
                     "time": f"2026-04-{(i % 28) + 1:02d}",
-                    "open": price - 0.02,
+                    "open": price - 0.04,
                     "close": price,
-                    "high": price + 0.03,
-                    "low": price - 0.03,
-                    "volume": 120000,
-                    "amount": price * 120000,
+                    "high": price + 0.08,
+                    "low": price - 0.08,
+                    "volume": 120000 + i * 300,
+                    "amount": price * (120000 + i * 300),
                 }
             )
         signal = score_rejuvenation(points)
-        self.assertLess(signal["risk_reward_ratio"], 1.5)
-        self.assertNotEqual(signal["status"], "buy_watch")
+        self.assertGreaterEqual(signal["score"], 60)
+        self.assertIn(signal["status"], {"buy_watch", "watch"})
+        self.assertIn("回踩不破MA20", signal["tags"])
 
     def test_intraday_confirmation_flags_invalid(self):
         daily_signal = {"stop_price": 9.0, "observe_price": 10.0}
@@ -219,6 +223,56 @@ class StrategyTests(unittest.TestCase):
         summary = summarize_backtest([{"return_pct": 10}, {"return_pct": -5}, {"return_pct": 0}])
         self.assertEqual(summary["avg_return_pct"], 1.67)
         self.assertEqual(summary["win_rate_pct"], 33.33)
+
+    def make_history(self, symbol="sh600000", start=10.0, drift=0.04, shock_at=None, shock=0.0):
+        points = []
+        price = start
+        for i in range(180):
+            if shock_at is not None and i >= shock_at:
+                price += shock
+            else:
+                price += drift
+            volume = 100000 + i * 500
+            points.append(
+                {
+                    "time": f"2026-{((i // 28) % 6) + 1:02d}-{(i % 28) + 1:02d}",
+                    "open": round(price - 0.03, 3),
+                    "close": round(price, 3),
+                    "high": round(price + 0.05, 3),
+                    "low": round(price - 0.05, 3),
+                    "volume": volume,
+                    "amount": round(price * volume, 2),
+                }
+            )
+        return {"symbol": symbol, "name": symbol, "points": points}
+
+    def test_cli_rolling_backtest_rolls_each_entry_day(self):
+        histories = [
+            self.make_history("sh600000", drift=0.05),
+            self.make_history("sz000001", drift=0.02),
+        ]
+        result = run_rolling_backtest(
+            histories,
+            top=1,
+            hold_days=30,
+            window_days=40,
+        )
+        self.assertEqual(result["meta"]["hold_days"], 30)
+        self.assertGreater(result["summary"]["sample_count"], 0)
+        self.assertEqual(result["summary"]["avg_daily_picks"], 1.0)
+        self.assertLessEqual(len(result["latest_picks"]), 1)
+
+    def test_cli_summarize_rows(self):
+        rows = [
+            {"return_pct": 8, "max_drawdown_pct": -2, "entry_date": "2026-01-01"},
+            {"return_pct": -4, "max_drawdown_pct": -7, "entry_date": "2026-01-02"},
+            {"return_pct": 3, "max_drawdown_pct": -1, "entry_date": "2026-01-03"},
+        ]
+        summary = summarize_rows(rows, entry_days=3)
+        self.assertEqual(summary["sample_count"], 3)
+        self.assertEqual(summary["win_rate_pct"], 66.67)
+        self.assertEqual(summary["avg_daily_picks"], 1.0)
+        self.assertEqual(summary["median_return_pct"], 3)
 
 
 if __name__ == "__main__":

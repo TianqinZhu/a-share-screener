@@ -207,11 +207,9 @@ function renderTable(rows) {
   body.innerHTML = rows
     .map((row) => {
       const changeClass = Number(row.change_pct) >= 0 ? "up" : "down";
-      const parts = row.signal.score_breakdown || {};
       const scoreTitle =
-        `技术 ${parts.technical ?? 0}/60，资金 ${parts.money ?? 0}/20，` +
-        `风险收益 ${parts.risk ?? 0}/15，流动性 ${parts.quality ?? 0}/5，` +
-        `盈亏比 ${row.signal.risk_reward_ratio ?? "-"}`;
+        `一波涨幅 ${row.signal.first_wave_pct ?? "-"}%，回踩 ${row.signal.pullback_pct ?? "-"}%，` +
+        `量能 ${row.signal.volume_ratio ?? "-"} 倍，MA20 偏离 ${row.signal.distance_to_ma20 ?? "-"}%`;
       return `
         <tr data-symbol="${row.symbol}">
           <td>${row.symbol.toUpperCase()}</td>

@@ -544,7 +544,23 @@ def get_market_spot_universe(page_size: int = 240) -> dict[str, Any]:
     try:
         return get_eastmoney_spot_candidates(page_size)
     except Exception:
-        return get_sina_market_spot_universe(80)
+        rows = [
+            {
+                "symbol": normalize_symbol(symbol),
+                "code": normalize_symbol(symbol)[2:],
+                "name": normalize_symbol(symbol),
+                "price": 10.0,
+                "change_pct": 0.0,
+                "amount": 200_000_000,
+            }
+            for symbol in DEFAULT_UNIVERSE
+        ]
+        return {
+            "rows": rows,
+            "total": len(rows),
+            "source": "default_universe_fallback",
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
 
 def market_prefilter(rows: list[dict[str, Any]], deep_limit: int, min_amount: float) -> list[dict[str, Any]]:
@@ -826,116 +842,51 @@ def score_rejuvenation(daily_points: list[dict[str, Any]]) -> dict[str, Any]:
             "score": 0,
             "reason": "日线不足 80 根，暂不参与筛选",
             "tags": ["数据不足"],
-            "score_breakdown": {"technical": 0, "money": 0, "risk": 0, "quality": 0},
         }
     latest = points[-1]
+    closes = [p["close"] for p in points]
     recent = points[-45:]
     base_low = min(p["low"] for p in points[-80:-20])
     peak = max(recent[:-3], key=lambda p: p["high"])
-    peak_index = recent.index(peak)
-    after_peak = recent[peak_index + 1 :] or recent[-10:]
-    pullback_low = min(p["low"] for p in after_peak)
-    pullback_low_point = min(after_peak, key=lambda p: p["low"])
+    pullback_low = min(p["low"] for p in recent[recent.index(peak) + 1 :] or recent[-10:])
     first_wave_pct = (peak["high"] - base_low) / base_low * 100 if base_low else 0.0
     pullback_pct = (peak["high"] - pullback_low) / peak["high"] * 100 if peak["high"] else 0.0
     ma20 = latest.get("ma20") or 0.0
     ma60 = latest.get("ma60") or 0.0
-    ma5 = latest.get("ma5") or 0.0
-    ma10 = latest.get("ma10") or 0.0
     ma20_prev = points[-6].get("ma20") or ma20
-    ma20_prev_10 = points[-11].get("ma20") or ma20
-    ma60_prev_10 = points[-11].get("ma60") or ma60
     volume_ratio = (
         latest["volume"] / latest["vma20"]
         if latest.get("vma20") and latest.get("vma20") > 0
         else 0.0
     )
-    before_peak = recent[max(0, peak_index - 20) : peak_index] or recent[:peak_index]
-    pullback_volume_ratio = average([p["volume"] for p in after_peak]) / average([p["volume"] for p in before_peak]) if average([p["volume"] for p in before_peak]) else 0.0
-    recent_amount_avg = average([p.get("amount", 0.0) for p in points[-5:]])
-    base_amount_avg = average([p.get("amount", 0.0) for p in points[-25:-5]])
-    amount_ratio = recent_amount_avg / base_amount_avg if base_amount_avg else 0.0
-    avg_amount_20 = average([p.get("amount", 0.0) for p in points[-20:]])
-    volatility_20d = average([abs(p.get("change_pct", 0.0)) for p in points[-20:]])
-    ma20_slope_pct = (ma20 - ma20_prev_10) / ma20_prev_10 * 100 if ma20_prev_10 else 0.0
-    ma60_slope_pct = (ma60 - ma60_prev_10) / ma60_prev_10 * 100 if ma60_prev_10 else 0.0
     above_ma20 = latest["close"] >= ma20 if ma20 else False
     ma20_support = pullback_low >= ma20 * 0.985 if ma20 else False
-    prior_pullback_lows = [p["low"] for p in recent[:peak_index] if p["time"] != pullback_low_point["time"]]
-    higher_low = pullback_low >= min(prior_pullback_lows[-20:] or [pullback_low]) * 0.995
-    trend_ok = bool(ma20 and ma60 and latest["close"] > ma20 > ma60 and ma20 >= ma20_prev and ma20_slope_pct >= 0)
+    trend_ok = bool(ma20 and ma60 and latest["close"] > ma20 > ma60 and ma20 >= ma20_prev)
     wave_ok = first_wave_pct >= 15
     pullback_ok = 3 <= pullback_pct <= 14
-    reclaim_ok = bool(ma5 and ma10 and latest["close"] >= ma5 >= ma10 * 0.995)
-    volume_ok = 0.75 <= volume_ratio <= 2.4
-    pullback_shrink_ok = 0.35 <= pullback_volume_ratio <= 1.15
-    amount_ok = 0.75 <= amount_ratio <= 1.85
-    not_blowoff = volume_ratio <= 3.2 and abs(latest.get("change_pct", 0.0)) <= 7.0
+    reclaim_ok = latest.get("ma5") and latest.get("ma10") and latest["close"] >= latest["ma5"] >= latest["ma10"] * 0.995
+    volume_ok = 0.85 <= volume_ratio <= 2.8
 
-    stop_candidates = [pullback_low, ma20 * 0.98 if ma20 else pullback_low]
-    stop_price = min(c for c in stop_candidates if c > 0)
-    observe_price = max(ma5 or latest["close"], ma10 or latest["close"])
-    target_price = peak["high"]
-    stop_risk_pct = (observe_price - stop_price) / observe_price * 100 if observe_price else 0.0
-    upside_pct = (target_price - observe_price) / observe_price * 100 if observe_price else 0.0
-    risk_reward_ratio = upside_pct / stop_risk_pct if stop_risk_pct > 0 else 0.0
-    distance_to_ma20 = (latest["close"] - ma20) / ma20 * 100 if ma20 else 0.0
-    chase_risk_ok = -1.5 <= distance_to_ma20 <= 8.0
+    score = 0
+    score += 24 if wave_ok else max(0, min(18, first_wave_pct))
+    score += 20 if pullback_ok else 8
+    score += 20 if ma20_support and above_ma20 else 0
+    score += 18 if trend_ok else 6 if above_ma20 else 0
+    score += 12 if reclaim_ok else 0
+    score += 6 if volume_ok else 0
+    score = int(max(0, min(100, round(score))))
 
-    wave_score = 12 if wave_ok else clamp(first_wave_pct / 15 * 10, 0, 10)
-    pullback_score = 12 if pullback_ok else 6 if 2 <= pullback_pct <= 18 else 2
-    support_score = 14 if ma20_support and above_ma20 else 8 if above_ma20 else 0
-    trend_score = 14 if trend_ok else 8 if above_ma20 and ma20_slope_pct >= -0.5 else 0
-    near_reclaim = bool(ma10 and latest["close"] >= ma10)
-    reclaim_score = 8 if reclaim_ok else 3 if near_reclaim else 0
-    higher_low_bonus = 3 if higher_low else 0
-    technical_score = min(60, wave_score + pullback_score + support_score + trend_score + reclaim_score + higher_low_bonus)
-
-    shrink_score = 8 if pullback_shrink_ok else 4 if pullback_volume_ratio <= 1.35 else 0
-    amount_score = 5 if amount_ok else 3 if 0.55 <= amount_ratio <= 2.4 else 0
-    volume_score = 5 if volume_ok else 2 if 0.55 <= volume_ratio <= 3.0 else 0
-    blowoff_score = 2 if not_blowoff else 0
-    money_score = shrink_score + amount_score + volume_score + blowoff_score
-
-    rr_score = 8 if risk_reward_ratio >= 2.0 else 6 if risk_reward_ratio >= 1.5 else 3 if risk_reward_ratio >= 1.0 else 0
-    distance_score = 4 if chase_risk_ok else 2 if -3 <= distance_to_ma20 <= 12 else 0
-    stop_score = 3 if 2 <= stop_risk_pct <= 9 else 1 if 0 < stop_risk_pct <= 13 else 0
-    risk_score = rr_score + distance_score + stop_score
-
-    liquidity_score = 2 if avg_amount_20 >= 100_000_000 else 1 if avg_amount_20 >= 50_000_000 else 0
-    volatility_score = 3 if 0.7 <= volatility_20d <= 4.2 else 1 if volatility_20d <= 6.0 else 0
-    quality_score = liquidity_score + volatility_score
-
-    score_breakdown = {
-        "technical": int(round(technical_score)),
-        "money": int(round(money_score)),
-        "risk": int(round(risk_score)),
-        "quality": int(round(quality_score)),
-    }
-    risk_ok = risk_reward_ratio >= 1.2 and chase_risk_ok and stop_risk_pct <= 12
-    raw_score = int(max(0, min(100, round(sum(score_breakdown.values())))))
-    score_cap = 100
-    if risk_reward_ratio <= 0:
-        score_cap = min(score_cap, 48)
-    elif risk_reward_ratio < 0.8:
-        score_cap = min(score_cap, 55)
-    elif risk_reward_ratio < 1.2:
-        score_cap = min(score_cap, 62)
-    if not chase_risk_ok:
-        score_cap = min(score_cap, 60 if distance_to_ma20 > 12 else 68)
-    if stop_risk_pct > 12:
-        score_cap = min(score_cap, 66)
-    if not not_blowoff:
-        score_cap = min(score_cap, 64)
-    score = min(raw_score, score_cap)
-
-    if score >= 76 and trend_ok and ma20_support and reclaim_ok and risk_reward_ratio >= 1.5 and chase_risk_ok and not_blowoff:
+    if score >= 78 and trend_ok and ma20_support and reclaim_ok:
         status = "buy_watch"
-    elif score >= 62 and above_ma20 and reclaim_ok and pullback_shrink_ok and risk_ok:
+    elif score >= 60 and above_ma20:
         status = "watch"
     else:
         status = "avoid"
 
+    stop_candidates = [pullback_low, ma20 * 0.98 if ma20 else pullback_low]
+    stop_price = min(c for c in stop_candidates if c > 0)
+    observe_price = max(latest.get("ma5") or latest["close"], latest.get("ma10") or latest["close"])
+    distance_to_ma20 = (latest["close"] - ma20) / ma20 * 100 if ma20 else 0.0
     tags = []
     if wave_ok:
         tags.append("一波上涨")
@@ -945,14 +896,8 @@ def score_rejuvenation(daily_points: list[dict[str, Any]]) -> dict[str, Any]:
         tags.append("趋势向上")
     if reclaim_ok:
         tags.append("站回短均线")
-    if pullback_shrink_ok:
-        tags.append("回踩缩量")
-    if volume_ok and amount_ok:
-        tags.append("量价健康")
-    if risk_reward_ratio >= 1.5:
-        tags.append("盈亏比合格")
-    if not chase_risk_ok:
-        tags.append("偏离均线")
+    if volume_ok:
+        tags.append("量能温和")
     if not tags:
         tags.append("形态不足")
     reason = "；".join(tags)
@@ -968,17 +913,6 @@ def score_rejuvenation(daily_points: list[dict[str, Any]]) -> dict[str, Any]:
         "pullback_pct": round(pullback_pct, 2),
         "distance_to_ma20": round(distance_to_ma20, 2),
         "volume_ratio": round(volume_ratio, 2),
-        "pullback_volume_ratio": round(pullback_volume_ratio, 2),
-        "amount_ratio": round(amount_ratio, 2),
-        "risk_reward_ratio": round(risk_reward_ratio, 2),
-        "stop_risk_pct": round(stop_risk_pct, 2),
-        "target_price": round(target_price, 2),
-        "ma20_slope_pct": round(ma20_slope_pct, 2),
-        "ma60_slope_pct": round(ma60_slope_pct, 2),
-        "avg_amount_20": round(avg_amount_20, 2),
-        "volatility_20d": round(volatility_20d, 2),
-        "score_breakdown": score_breakdown,
-        "score_model": "steady_swing_v2",
         "observe_price": round(observe_price, 2),
         "stop_price": round(stop_price, 2),
         "latest_date": latest["time"],
@@ -1067,13 +1001,6 @@ def build_detail_analysis(
             "value": f"{signal.get('score', 0)} 分 / {signal.get('reason', '-')}",
         },
         {
-            "label": "评分拆解",
-            "value": (
-                f"技术 {breakdown.get('technical', 0)}/60，资金 {breakdown.get('money', 0)}/20，"
-                f"风险收益 {breakdown.get('risk', 0)}/15，流动性 {breakdown.get('quality', 0)}/5"
-            ),
-        },
-        {
             "label": "一波与回踩",
             "value": f"一波涨幅 {signal.get('first_wave_pct', 0)}%，回踩 {signal.get('pullback_pct', 0)}%",
         },
@@ -1086,23 +1013,39 @@ def build_detail_analysis(
         },
         {
             "label": "量能",
-            "value": (
-                f"最新量能约为 20 日均量的 {signal.get('volume_ratio', 0)} 倍，"
-                f"回踩量约为前段量的 {signal.get('pullback_volume_ratio', 0)} 倍"
-            ),
+            "value": f"最新量能约为 20 日均量的 {signal.get('volume_ratio', 0)} 倍",
         },
         {
-            "label": "风险收益",
-            "value": (
-                f"观察价 {signal.get('observe_price', '-')}，止损 {signal.get('stop_price', '-')}，"
-                f"前高目标 {signal.get('target_price', '-')}，盈亏比 {signal.get('risk_reward_ratio', 0)}"
-            ),
-        },
-        {
-            "label": "趋势斜率",
-            "value": f"MA20 近 10 日斜率 {signal.get('ma20_slope_pct', 0)}%，MA60 斜率 {signal.get('ma60_slope_pct', 0)}%",
+            "label": "观察与止损",
+            "value": f"观察价 {signal.get('observe_price', '-')}，止损 {signal.get('stop_price', '-')}",
         },
     ]
+    if breakdown:
+        technical_items.append(
+            {
+                "label": "评分拆解",
+                "value": (
+                    f"技术 {breakdown.get('technical', 0)}/60，资金 {breakdown.get('money', 0)}/20，"
+                    f"风险收益 {breakdown.get('risk', 0)}/15，流动性 {breakdown.get('quality', 0)}/5"
+                ),
+            }
+        )
+    if signal.get("risk_reward_ratio") is not None:
+        technical_items.append(
+            {
+                "label": "风险收益",
+                "value": (
+                    f"前高目标 {signal.get('target_price', '-')}，盈亏比 {signal.get('risk_reward_ratio', 0)}"
+                ),
+            }
+        )
+    if signal.get("ma20_slope_pct") is not None:
+        technical_items.append(
+            {
+                "label": "趋势斜率",
+                "value": f"MA20 近 10 日斜率 {signal.get('ma20_slope_pct', 0)}%，MA60 斜率 {signal.get('ma60_slope_pct', 0)}%",
+            }
+        )
     fundamental_items = [
         {"label": "总市值", "value": fundamentals.get("market_cap")},
         {"label": "流通市值", "value": fundamentals.get("float_market_cap")},
@@ -1136,9 +1079,9 @@ def build_detail_analysis(
         risks.append(f"观察价 {observe_price}，未有效站上前不宜把分钟波动当成二波启动。")
     if signal.get("distance_to_ma20", 0) > 8:
         risks.append("价格距离 MA20 偏远，存在追高回落风险。")
-    if signal.get("pullback_volume_ratio", 0) > 1.35:
+    if signal.get("pullback_volume_ratio") is not None and signal.get("pullback_volume_ratio", 0) > 1.35:
         risks.append("回踩阶段没有明显缩量，可能不是健康洗盘。")
-    if signal.get("risk_reward_ratio", 0) < 1.5:
+    if signal.get("risk_reward_ratio") is not None and signal.get("risk_reward_ratio", 0) < 1.5:
         risks.append("观察价到前高的潜在空间不足，盈亏比不够理想。")
     if fundamentals.get("pe_dynamic") and fundamentals["pe_dynamic"] > 80:
         risks.append("动态市盈率较高，基本面估值容错率偏低。")
@@ -1355,6 +1298,7 @@ def summarize_backtest(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "best_return_pct": round(max(returns), 2),
         "worst_return_pct": round(min(returns), 2),
     }
+
 
 
 def backtest_strategy(
