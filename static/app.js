@@ -86,14 +86,20 @@ async function screen() {
   setStatus(symbols ? "自定义股票池扫描中..." : "全A主流板块扫描中，可能需要几十秒...");
   $("screenButton").disabled = true;
   try {
-    const qs = new URLSearchParams({ symbols, limit, deep_limit: "160" });
+    const qs = new URLSearchParams({ symbols, limit, deep_limit: "40" });
     const data = await fetchJson(`/data/screen?${qs}`);
     state.rows = data.rows;
     renderSummary(data);
     updateFilterTabs();
-    const rows = visibleRows();
+    let rows = visibleRows();
+    if (!rows.length && state.rows.length && state.filter === "qualified") {
+      state.filter = "all";
+      updateFilterTabs();
+      rows = visibleRows();
+    }
     renderTable(rows);
-    setStatus(`已刷新 ${data.generated_at}`);
+    const statusSuffix = state.filter === "all" ? "，当前无严格买入信号，已显示评分前列候选" : "";
+    setStatus(`已刷新 ${data.generated_at}${statusSuffix}`);
     if (rows.length) {
       await selectSymbol(rows[0].symbol);
     }
@@ -111,7 +117,7 @@ async function backtest() {
   setStatus(symbols ? "自定义股票池回测中..." : "全A主流板块快速回测中，可能需要几十秒...");
   $("backtestButton").disabled = true;
   try {
-    const qs = new URLSearchParams({ symbols, limit, lookback_days: lookbackDays, deep_limit: "160" });
+    const qs = new URLSearchParams({ symbols, limit, lookback_days: lookbackDays, deep_limit: "40" });
     const data = await fetchJson(`/data/backtest?${qs}`);
     renderBacktest(data);
     const meta = data.backtest_meta || {};

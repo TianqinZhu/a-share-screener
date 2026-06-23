@@ -374,6 +374,44 @@ def parse_sina_market_rows(payload: list[dict[str, Any]]) -> list[dict[str, Any]
     return rows
 
 
+def get_eastmoney_spot_candidates(page_size: int = 240) -> dict[str, Any]:
+    cache_key = f"market-spot-eastmoney:{page_size}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def fetch(fid: str) -> tuple[list[dict[str, Any]], int]:
+        params = {
+            "pn": "1",
+            "pz": str(page_size),
+            "po": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": fid,
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f13,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18",
+        }
+        url = EASTMONEY_CLIST_URL + "?" + urllib.parse.urlencode(params)
+        text = request_text(url, referer="https://quote.eastmoney.com/", timeout=10)
+        payload = json.loads(text)
+        if payload.get("rc") != 0:
+            raise MarketDataError(f"Eastmoney market list error {payload.get('rc')}")
+        return parse_eastmoney_spot(payload)
+
+    by_amount, total = fetch("f6")
+    by_momentum, momentum_total = fetch("f3")
+    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_amount + by_momentum}
+    result = {
+        "rows": list(combined.values()),
+        "total": max(total, momentum_total, len(combined)),
+        "source": "eastmoney_spot_fast",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    cache.set(cache_key, result, MARKET_LIST_TTL_SECONDS)
+    return result
+
+
 def scaled_number(value: Any, scale: float = 100.0) -> float | None:
     if value in (None, "-", ""):
         return None
@@ -452,7 +490,7 @@ def get_stock_snapshot(symbol: str) -> dict[str, Any]:
     return result
 
 
-def get_market_spot_universe(page_size: int = 80) -> dict[str, Any]:
+def get_sina_market_spot_universe(page_size: int = 80) -> dict[str, Any]:
     cache_key = f"market-spot-sina:{page_size}"
     cached = cache.get(cache_key)
     if cached is not None:
@@ -493,6 +531,13 @@ def get_market_spot_universe(page_size: int = 80) -> dict[str, Any]:
     return result
 
 
+def get_market_spot_universe(page_size: int = 240) -> dict[str, Any]:
+    try:
+        return get_eastmoney_spot_candidates(page_size)
+    except Exception:
+        return get_sina_market_spot_universe(80)
+
+
 def market_prefilter(rows: list[dict[str, Any]], deep_limit: int, min_amount: float) -> list[dict[str, Any]]:
     filtered = []
     for row in rows:
@@ -506,12 +551,13 @@ def market_prefilter(rows: list[dict[str, Any]], deep_limit: int, min_amount: fl
         if price <= 2 or amount < min_amount:
             continue
         filtered.append(row)
-    by_amount = sorted(filtered, key=lambda row: row.get("amount") or 0, reverse=True)[: max(40, deep_limit // 2)]
+    slice_size = max(10, min(len(filtered), max(deep_limit, deep_limit // 2)))
+    by_amount = sorted(filtered, key=lambda row: row.get("amount") or 0, reverse=True)[:slice_size]
     by_momentum = sorted(
         filtered,
         key=lambda row: ((row.get("change_pct") or 0), (row.get("amount") or 0)),
         reverse=True,
-    )[: max(40, deep_limit // 2)]
+    )[:slice_size]
     combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_amount + by_momentum}
     return list(combined.values())[:deep_limit]
 
@@ -851,9 +897,10 @@ def score_rejuvenation(daily_points: list[dict[str, Any]]) -> dict[str, Any]:
     }
     score = int(max(0, min(100, round(sum(score_breakdown.values())))))
 
-    if score >= 76 and trend_ok and ma20_support and reclaim_ok and risk_reward_ratio >= 1.5 and not_blowoff:
+    risk_ok = risk_reward_ratio >= 1.2 and chase_risk_ok and stop_risk_pct <= 12
+    if score >= 76 and trend_ok and ma20_support and reclaim_ok and risk_reward_ratio >= 1.5 and chase_risk_ok and not_blowoff:
         status = "buy_watch"
-    elif score >= 62 and above_ma20 and ma20_support:
+    elif score >= 62 and above_ma20 and ma20_support and risk_ok:
         status = "watch"
     else:
         status = "avoid"
@@ -1150,7 +1197,7 @@ def score_spot_candidate(spot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def recommend_market(top: int = 10, deep_limit: int = 160, min_amount: float = 100_000_000) -> dict[str, Any]:
+def recommend_market(top: int = 10, deep_limit: int = 40, min_amount: float = 100_000_000) -> dict[str, Any]:
     market = get_market_spot_universe()
     candidates = market_prefilter(market["rows"], deep_limit=deep_limit, min_amount=min_amount)
     scored: list[dict[str, Any]] = []
@@ -1278,7 +1325,7 @@ def summarize_backtest(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def backtest_strategy(
     symbols: list[str] | None = None,
     top: int = 10,
-    deep_limit: int = 160,
+    deep_limit: int = 40,
     lookback_days: int = 30,
     min_amount: float = 100_000_000,
 ) -> dict[str, Any]:
@@ -1398,13 +1445,13 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
                 symbols = parse_symbols_param(params)
                 limit = int(one_param(params, "limit", "10"))
                 if not symbols:
-                    deep_limit = int(one_param(params, "deep_limit", "160"))
+                    deep_limit = int(one_param(params, "deep_limit", "40"))
                     min_amount = float(one_param(params, "min_amount", "100000000"))
                     json_response(
                         self,
                         recommend_market(
                             top=max(1, min(limit, 20)),
-                            deep_limit=max(40, min(deep_limit, 360)),
+                            deep_limit=max(10, min(deep_limit, 120)),
                             min_amount=min_amount,
                         ),
                     )
@@ -1434,7 +1481,7 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
             elif parsed.path == "/api/backtest":
                 symbols = parse_symbols_param(params)
                 limit = int(one_param(params, "limit", "10"))
-                deep_limit = int(one_param(params, "deep_limit", "160"))
+                deep_limit = int(one_param(params, "deep_limit", "40"))
                 lookback_days = int(one_param(params, "lookback_days", "30"))
                 min_amount = float(one_param(params, "min_amount", "100000000"))
                 json_response(
@@ -1442,7 +1489,7 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
                     backtest_strategy(
                         symbols=symbols,
                         top=max(1, min(limit, 20)),
-                        deep_limit=max(40, min(deep_limit, 360)),
+                        deep_limit=max(10, min(deep_limit, 120)),
                         lookback_days=max(5, min(lookback_days, 180)),
                         min_amount=min_amount,
                     ),
