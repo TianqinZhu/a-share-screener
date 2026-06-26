@@ -374,53 +374,6 @@ def parse_sina_market_rows(payload: list[dict[str, Any]]) -> list[dict[str, Any]
     return rows
 
 
-def get_eastmoney_spot_candidates(page_size: int = 240) -> dict[str, Any]:
-    cache_key = f"market-spot-eastmoney:{page_size}"
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    def fetch(fid: str) -> tuple[list[dict[str, Any]], int]:
-        params = {
-            "pn": "1",
-            "pz": str(page_size),
-            "po": "1",
-            "np": "1",
-            "fltt": "2",
-            "invt": "2",
-            "fid": fid,
-            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-            "fields": "f12,f13,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18",
-        }
-        url = EASTMONEY_CLIST_URL + "?" + urllib.parse.urlencode(params)
-        text = request_text(url, referer="https://quote.eastmoney.com/", timeout=10)
-        payload = json.loads(text)
-        if payload.get("rc") != 0:
-            raise MarketDataError(f"Eastmoney market list error {payload.get('rc')}")
-        return parse_eastmoney_spot(payload)
-
-    by_amount, total = fetch("f6")
-    by_momentum, momentum_total = fetch("f3")
-    active_pullback = [
-        row
-        for row in by_amount
-        if -3.5 <= (row.get("change_pct") or 0) <= 2.5 and (row.get("amount") or 0) >= 100_000_000
-    ]
-    balanced = sorted(
-        active_pullback,
-        key=lambda row: (abs((row.get("change_pct") or 0) - 0.5), -(row.get("amount") or 0)),
-    )
-    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_amount + balanced + by_momentum}
-    result = {
-        "rows": list(combined.values()),
-        "total": max(total, momentum_total, len(combined)),
-        "source": "eastmoney_spot_fast",
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    cache.set(cache_key, result, MARKET_LIST_TTL_SECONDS)
-    return result
-
-
 def scaled_number(value: Any, scale: float = 100.0) -> float | None:
     if value in (None, "-", ""):
         return None
@@ -499,7 +452,7 @@ def get_stock_snapshot(symbol: str) -> dict[str, Any]:
     return result
 
 
-def get_sina_market_spot_universe(page_size: int = 80) -> dict[str, Any]:
+def get_market_spot_universe(page_size: int = 80) -> dict[str, Any]:
     cache_key = f"market-spot-sina:{page_size}"
     cached = cache.get(cache_key)
     if cached is not None:
@@ -540,29 +493,6 @@ def get_sina_market_spot_universe(page_size: int = 80) -> dict[str, Any]:
     return result
 
 
-def get_market_spot_universe(page_size: int = 240) -> dict[str, Any]:
-    try:
-        return get_eastmoney_spot_candidates(page_size)
-    except Exception:
-        rows = [
-            {
-                "symbol": normalize_symbol(symbol),
-                "code": normalize_symbol(symbol)[2:],
-                "name": normalize_symbol(symbol),
-                "price": 10.0,
-                "change_pct": 0.0,
-                "amount": 200_000_000,
-            }
-            for symbol in DEFAULT_UNIVERSE
-        ]
-        return {
-            "rows": rows,
-            "total": len(rows),
-            "source": "default_universe_fallback",
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-
 def market_prefilter(rows: list[dict[str, Any]], deep_limit: int, min_amount: float) -> list[dict[str, Any]]:
     filtered = []
     for row in rows:
@@ -576,22 +506,13 @@ def market_prefilter(rows: list[dict[str, Any]], deep_limit: int, min_amount: fl
         if price <= 2 or amount < min_amount:
             continue
         filtered.append(row)
-    slice_size = max(10, min(len(filtered), max(deep_limit, deep_limit // 2)))
-    by_amount = sorted(filtered, key=lambda row: row.get("amount") or 0, reverse=True)[:slice_size]
+    by_amount = sorted(filtered, key=lambda row: row.get("amount") or 0, reverse=True)[: max(40, deep_limit // 2)]
     by_momentum = sorted(
         filtered,
         key=lambda row: ((row.get("change_pct") or 0), (row.get("amount") or 0)),
         reverse=True,
-    )[:slice_size]
-    by_balanced = sorted(
-        filtered,
-        key=lambda row: (
-            0 if -3.5 <= (row.get("change_pct") or 0) <= 2.5 else 1,
-            abs((row.get("change_pct") or 0) - 0.5),
-            -(row.get("amount") or 0),
-        ),
-    )[:slice_size]
-    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_balanced + by_amount + by_momentum}
+    )[: max(40, deep_limit // 2)]
+    combined: dict[str, dict[str, Any]] = {row["symbol"]: row for row in by_amount + by_momentum}
     return list(combined.values())[:deep_limit]
 
 
@@ -826,14 +747,6 @@ def enrich_daily(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return enriched
 
 
-def average(values: list[float]) -> float:
-    return sum(values) / len(values) if values else 0.0
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
 def score_rejuvenation(daily_points: list[dict[str, Any]]) -> dict[str, Any]:
     points = enrich_daily(daily_points)
     if len(points) < 80:
@@ -994,7 +907,6 @@ def build_detail_analysis(
     )
     ma = signal.get("ma") or {}
     fundamentals = snapshot or {}
-    breakdown = signal.get("score_breakdown") or {}
     technical_items = [
         {
             "label": "日线信号",
@@ -1015,37 +927,7 @@ def build_detail_analysis(
             "label": "量能",
             "value": f"最新量能约为 20 日均量的 {signal.get('volume_ratio', 0)} 倍",
         },
-        {
-            "label": "观察与止损",
-            "value": f"观察价 {signal.get('observe_price', '-')}，止损 {signal.get('stop_price', '-')}",
-        },
     ]
-    if breakdown:
-        technical_items.append(
-            {
-                "label": "评分拆解",
-                "value": (
-                    f"技术 {breakdown.get('technical', 0)}/60，资金 {breakdown.get('money', 0)}/20，"
-                    f"风险收益 {breakdown.get('risk', 0)}/15，流动性 {breakdown.get('quality', 0)}/5"
-                ),
-            }
-        )
-    if signal.get("risk_reward_ratio") is not None:
-        technical_items.append(
-            {
-                "label": "风险收益",
-                "value": (
-                    f"前高目标 {signal.get('target_price', '-')}，盈亏比 {signal.get('risk_reward_ratio', 0)}"
-                ),
-            }
-        )
-    if signal.get("ma20_slope_pct") is not None:
-        technical_items.append(
-            {
-                "label": "趋势斜率",
-                "value": f"MA20 近 10 日斜率 {signal.get('ma20_slope_pct', 0)}%，MA60 斜率 {signal.get('ma60_slope_pct', 0)}%",
-            }
-        )
     fundamental_items = [
         {"label": "总市值", "value": fundamentals.get("market_cap")},
         {"label": "流通市值", "value": fundamentals.get("float_market_cap")},
@@ -1067,8 +949,6 @@ def build_detail_analysis(
         positive.append(f"盘中确认：{confirmation.get('reason')}")
     if day_change_pct is not None:
         positive.append(f"最近交易日涨跌幅约 {round(day_change_pct, 2)}%。")
-    if signal.get("risk_reward_ratio") is not None:
-        positive.append(f"观察价到前高的盈亏比约 {signal.get('risk_reward_ratio')}，低于 1.5 时会降低推荐级别。")
 
     risks = []
     stop_price = signal.get("stop_price")
@@ -1077,12 +957,6 @@ def build_detail_analysis(
         risks.append(f"策略失效参考位 {stop_price}，跌破后回踩结构不再有效。")
     if observe_price:
         risks.append(f"观察价 {observe_price}，未有效站上前不宜把分钟波动当成二波启动。")
-    if signal.get("distance_to_ma20", 0) > 8:
-        risks.append("价格距离 MA20 偏远，存在追高回落风险。")
-    if signal.get("pullback_volume_ratio") is not None and signal.get("pullback_volume_ratio", 0) > 1.35:
-        risks.append("回踩阶段没有明显缩量，可能不是健康洗盘。")
-    if signal.get("risk_reward_ratio") is not None and signal.get("risk_reward_ratio", 0) < 1.5:
-        risks.append("观察价到前高的潜在空间不足，盈亏比不够理想。")
     if fundamentals.get("pe_dynamic") and fundamentals["pe_dynamic"] > 80:
         risks.append("动态市盈率较高，基本面估值容错率偏低。")
     if fundamentals.get("turnover") and fundamentals["turnover"] > 12:
@@ -1171,7 +1045,7 @@ def score_spot_candidate(spot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def recommend_market(top: int = 10, deep_limit: int = 40, min_amount: float = 100_000_000) -> dict[str, Any]:
+def recommend_market(top: int = 10, deep_limit: int = 160, min_amount: float = 100_000_000) -> dict[str, Any]:
     market = get_market_spot_universe()
     candidates = market_prefilter(market["rows"], deep_limit=deep_limit, min_amount=min_amount)
     scored: list[dict[str, Any]] = []
@@ -1210,11 +1084,7 @@ def recommend_market(top: int = 10, deep_limit: int = 40, min_amount: float = 10
         reverse=True,
     )
     fallback = sorted(scored, key=lambda row: row["signal"].get("score", 0), reverse=True)
-    rows = qualified[:top]
-    if len(rows) < top:
-        used = {row["symbol"] for row in rows}
-        rows.extend(row for row in fallback if row["symbol"] not in used)
-        rows = rows[:top]
+    rows = (qualified or fallback)[:top]
     latest_trade_date = ""
     for row in rows:
         latest_trade_date = row["signal"].get("latest_date") or latest_trade_date
@@ -1300,11 +1170,10 @@ def summarize_backtest(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-
 def backtest_strategy(
     symbols: list[str] | None = None,
     top: int = 10,
-    deep_limit: int = 40,
+    deep_limit: int = 160,
     lookback_days: int = 30,
     min_amount: float = 100_000_000,
 ) -> dict[str, Any]:
@@ -1331,7 +1200,8 @@ def backtest_strategy(
                 errors += 1
 
     qualified = [row for row in scored if row["signal"].get("status") in {"buy_watch", "watch"}]
-    qualified.sort(
+    ranked_source = qualified or scored
+    ranked_source.sort(
         key=lambda row: (
             row["signal"].get("score", 0),
             row.get("max_gain_pct", 0),
@@ -1339,20 +1209,7 @@ def backtest_strategy(
         ),
         reverse=True,
     )
-    fallback = sorted(
-        scored,
-        key=lambda row: (
-            row["signal"].get("score", 0),
-            row.get("max_gain_pct", 0),
-            row.get("return_pct", 0),
-        ),
-        reverse=True,
-    )
-    rows = qualified[:top]
-    if len(rows) < top:
-        used = {row["symbol"] for row in rows}
-        rows.extend(row for row in fallback if row["symbol"] not in used)
-        rows = rows[:top]
+    rows = ranked_source[:top]
     as_of_date = rows[0]["as_of_date"] if rows else ""
     latest_date = rows[0]["latest_date"] if rows else ""
     for rank, row in enumerate(rows, start=1):
@@ -1404,10 +1261,6 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path.startswith("/data/"):
-            parsed = parsed._replace(path="/api/" + parsed.path[len("/data/"):])
-            self.handle_api(parsed)
-            return
         if parsed.path.startswith("/api/"):
             self.handle_api(parsed)
             return
@@ -1436,13 +1289,13 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
                 symbols = parse_symbols_param(params)
                 limit = int(one_param(params, "limit", "10"))
                 if not symbols:
-                    deep_limit = int(one_param(params, "deep_limit", "40"))
+                    deep_limit = int(one_param(params, "deep_limit", "160"))
                     min_amount = float(one_param(params, "min_amount", "100000000"))
                     json_response(
                         self,
                         recommend_market(
                             top=max(1, min(limit, 20)),
-                            deep_limit=max(10, min(deep_limit, 120)),
+                            deep_limit=max(40, min(deep_limit, 360)),
                             min_amount=min_amount,
                         ),
                     )
@@ -1472,7 +1325,7 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
             elif parsed.path == "/api/backtest":
                 symbols = parse_symbols_param(params)
                 limit = int(one_param(params, "limit", "10"))
-                deep_limit = int(one_param(params, "deep_limit", "40"))
+                deep_limit = int(one_param(params, "deep_limit", "160"))
                 lookback_days = int(one_param(params, "lookback_days", "30"))
                 min_amount = float(one_param(params, "min_amount", "100000000"))
                 json_response(
@@ -1480,7 +1333,7 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
                     backtest_strategy(
                         symbols=symbols,
                         top=max(1, min(limit, 20)),
-                        deep_limit=max(10, min(deep_limit, 120)),
+                        deep_limit=max(40, min(deep_limit, 360)),
                         lookback_days=max(5, min(lookback_days, 180)),
                         min_amount=min_amount,
                     ),

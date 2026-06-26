@@ -76,7 +76,7 @@ async function fetchJson(url) {
 }
 
 async function loadUniverse() {
-  const data = await fetchJson("/data/universe");
+  const data = await fetchJson("/api/universe");
   $("symbolsInput").value = data.symbols.join(",");
 }
 
@@ -86,20 +86,14 @@ async function screen() {
   setStatus(symbols ? "自定义股票池扫描中..." : "全A主流板块扫描中，可能需要几十秒...");
   $("screenButton").disabled = true;
   try {
-    const qs = new URLSearchParams({ symbols, limit, deep_limit: "40" });
-    const data = await fetchJson(`/data/screen?${qs}`);
+    const qs = new URLSearchParams({ symbols, limit, deep_limit: "160" });
+    const data = await fetchJson(`/api/screen?${qs}`);
     state.rows = data.rows;
     renderSummary(data);
     updateFilterTabs();
-    let rows = visibleRows();
-    if (!rows.length && state.rows.length && state.filter === "qualified") {
-      state.filter = "all";
-      updateFilterTabs();
-      rows = visibleRows();
-    }
+    const rows = visibleRows();
     renderTable(rows);
-    const statusSuffix = state.filter === "all" ? "，当前无严格买入信号，已显示评分前列候选" : "";
-    setStatus(`已刷新 ${data.generated_at}${statusSuffix}`);
+    setStatus(`已刷新 ${data.generated_at}`);
     if (rows.length) {
       await selectSymbol(rows[0].symbol);
     }
@@ -117,8 +111,8 @@ async function backtest() {
   setStatus(symbols ? "自定义股票池回测中..." : "全A主流板块快速回测中，可能需要几十秒...");
   $("backtestButton").disabled = true;
   try {
-    const qs = new URLSearchParams({ symbols, limit, lookback_days: lookbackDays, deep_limit: "40" });
-    const data = await fetchJson(`/data/backtest?${qs}`);
+    const qs = new URLSearchParams({ symbols, limit, lookback_days: lookbackDays, deep_limit: "160" });
+    const data = await fetchJson(`/api/backtest?${qs}`);
     renderBacktest(data);
     const meta = data.backtest_meta || {};
     setStatus(`回测完成 ${meta.as_of_date || "-"} 至 ${meta.latest_date || "-"}`);
@@ -207,20 +201,17 @@ function renderTable(rows) {
   body.innerHTML = rows
     .map((row) => {
       const changeClass = Number(row.change_pct) >= 0 ? "up" : "down";
-      const scoreTitle =
-        `一波涨幅 ${row.signal.first_wave_pct ?? "-"}%，回踩 ${row.signal.pullback_pct ?? "-"}%，` +
-        `量能 ${row.signal.volume_ratio ?? "-"} 倍，MA20 偏离 ${row.signal.distance_to_ma20 ?? "-"}%`;
       return `
         <tr data-symbol="${row.symbol}">
           <td>${row.symbol.toUpperCase()}</td>
           <td>${row.name || "-"}</td>
           <td>${formatNumber(row.price)}</td>
           <td class="${changeClass}">${formatNumber(row.change_pct)}%</td>
-          <td title="${escapeHtml(scoreTitle)}"><strong>${row.signal.score}</strong></td>
+          <td><strong>${row.signal.score}</strong></td>
           <td><span class="badge ${row.signal.status}">${statusLabels[row.signal.status] || row.signal.status}</span></td>
           <td>${formatNumber(row.signal.observe_price)}</td>
           <td>${formatNumber(row.signal.stop_price)}</td>
-          <td>${escapeHtml(row.signal.reason || "-")}</td>
+          <td>${row.signal.reason || "-"}</td>
         </tr>`;
     })
     .join("");
@@ -237,7 +228,7 @@ async function selectSymbol(symbol) {
   setStatus(`读取 ${symbol.toUpperCase()} ${periodLabels[state.period] || `${state.period}分`}明细...`);
   try {
     const qs = new URLSearchParams({ symbol, period: String(state.period) });
-    const data = await fetchJson(`/data/detail?${qs}`);
+    const data = await fetchJson(`/api/detail?${qs}`);
     renderDetail(data);
     setStatus(`明细已刷新 ${periodLabels[state.period] || `${state.period}分`} ${data.intraday.latest_time || ""}`);
   } catch (err) {
