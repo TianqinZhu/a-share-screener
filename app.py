@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import gzip
 import io
 import json
 import math
@@ -34,6 +35,10 @@ SINA_MINLINE_URL = (
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 EASTMONEY_STOCK_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
+EASTMONEY_COMPANY_SURVEY_URL = "https://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/PageAjax"
+EASTMONEY_BUSINESS_ANALYSIS_URL = "https://emweb.securities.eastmoney.com/PC_HSF10/BusinessAnalysis/PageAjax"
+EASTMONEY_ANNOUNCEMENT_URL = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+EASTMONEY_SEARCH_NEWS_URL = "https://searchapi.eastmoney.com/bussiness/Web/GetSearchList"
 TENCENT_DAILY_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 SINA_MARKET_CENTER_URL = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
 
@@ -42,6 +47,9 @@ INTRADAY_TTL_SECONDS = 30
 DAILY_TTL_SECONDS = 60 * 60
 MARKET_LIST_TTL_SECONDS = 90
 FUNDAMENTAL_TTL_SECONDS = 60 * 10
+COMPANY_PROFILE_TTL_SECONDS = 60 * 60 * 24 * 7
+BUSINESS_ANALYSIS_TTL_SECONDS = 60 * 60 * 24
+CATALYST_TTL_SECONDS = 60 * 30
 
 DEFAULT_UNIVERSE = [
     "sh600000",
@@ -163,6 +171,7 @@ def request_text(url: str, referer: str, timeout: float = 8.0) -> str:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
                 charset = resp.headers.get_content_charset()
+                content_encoding = resp.headers.get("Content-Encoding", "")
             break
         except urllib.error.HTTPError as exc:
             raise MarketDataError(f"HTTP {exc.code}: {url}") from exc
@@ -176,6 +185,12 @@ def request_text(url: str, referer: str, timeout: float = 8.0) -> str:
             raise MarketDataError(str(exc)) from exc
     else:
         raise MarketDataError(str(last_error))
+    return decode_response_body(raw, charset, content_encoding)
+
+
+def decode_response_body(raw: bytes, charset: str | None = None, content_encoding: str = "") -> str:
+    if raw.startswith(b"\x1f\x8b") or "gzip" in content_encoding.lower():
+        raw = gzip.decompress(raw)
     encodings = [charset] if charset else []
     encodings.extend(["utf-8", "gb18030"])
     for encoding in encodings:
@@ -450,6 +465,397 @@ def get_stock_snapshot(symbol: str) -> dict[str, Any]:
     result = parse_eastmoney_snapshot(payload, normalized)
     cache.set(cache_key, result, FUNDAMENTAL_TTL_SECONDS)
     return result
+
+
+def eastmoney_f10_code(symbol: str) -> str:
+    normalized = normalize_symbol(symbol)
+    prefix = "SH" if normalized.startswith("sh") else "SZ" if normalized.startswith("sz") else "BJ"
+    return f"{prefix}{normalized[2:]}"
+
+
+def announcement_stock_code(symbol: str) -> str:
+    return normalize_symbol(symbol)[2:]
+
+
+def clean_text(value: Any, max_length: int | None = None) -> str:
+    text = re.sub(r"<[^>]+>", "", str(value or ""))
+    text = re.sub(r"\s+", " ", text.replace("\u3000", " ")).strip()
+    if max_length and len(text) > max_length:
+        return text[: max_length - 1].rstrip() + "…"
+    return text
+
+
+def normalize_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    return match.group(0) if match else text[:10]
+
+
+def ratio_to_pct(value: Any) -> float | None:
+    number = parse_number(value, default=math.nan)
+    if math.isnan(number):
+        return None
+    if abs(number) <= 1:
+        number *= 100
+    return round(number, 2)
+
+
+def parse_company_survey(payload: dict[str, Any], symbol: str) -> dict[str, Any]:
+    basic = (payload.get("jbzl") or [{}])[0] or {}
+    overview = (payload.get("gsgk") or [{}])[0] or {}
+    intro = (
+        overview.get("CONTENT")
+        or overview.get("ORG_PROFILE")
+        or basic.get("ORG_PROFILE")
+        or basic.get("MAIN_BUSINESS")
+        or ""
+    )
+    return {
+        "symbol": normalize_symbol(symbol),
+        "name": clean_text(basic.get("SECURITY_NAME_ABBR") or basic.get("ORG_NAME") or ""),
+        "full_name": clean_text(basic.get("ORG_NAME") or ""),
+        "industry": clean_text(basic.get("EM2016") or basic.get("INDUSTRYCSRC1") or ""),
+        "csrc_industry": clean_text(basic.get("INDUSTRYCSRC1") or ""),
+        "market": clean_text(basic.get("TRADE_MARKET") or basic.get("SECURITY_TYPE") or ""),
+        "province": clean_text(basic.get("PROVINCE") or ""),
+        "website": clean_text(basic.get("ORG_WEB") or ""),
+        "listing_date": normalize_date(basic.get("LISTING_DATE") or basic.get("LISTINGDATE")),
+        "employees": parse_number(basic.get("EMP_NUM")),
+        "intro": clean_text(intro, 180),
+        "source": "eastmoney_f10_company",
+    }
+
+
+def parse_business_analysis(payload: dict[str, Any], top: int = 5) -> dict[str, Any]:
+    scope = clean_text(((payload.get("zyfw") or [{}])[0] or {}).get("BUSINESS_SCOPE"), 220)
+    rows = payload.get("zygcfx") or []
+    dated_rows = [row for row in rows if row.get("REPORT_DATE")]
+    latest_date = max((normalize_date(row.get("REPORT_DATE")) for row in dated_rows), default="")
+    current = [row for row in dated_rows if normalize_date(row.get("REPORT_DATE")) == latest_date]
+    product_rows = [row for row in current if str(row.get("MAINOP_TYPE") or "1") == "1"] or current
+    product_rows.sort(key=lambda row: parse_number(row.get("MBI_RATIO"), default=0), reverse=True)
+    items = []
+    for row in product_rows[:top]:
+        items.append(
+            {
+                "name": clean_text(row.get("ITEM_NAME") or row.get("MAIN_BUSINESS") or "-"),
+                "income": parse_number(row.get("MAIN_BUSINESS_INCOME")),
+                "income_ratio_pct": ratio_to_pct(row.get("MBI_RATIO")),
+                "gross_margin_pct": ratio_to_pct(row.get("GROSS_RPOFIT_RATIO")),
+                "type": str(row.get("MAINOP_TYPE") or ""),
+            }
+        )
+    return {
+        "business_scope": scope,
+        "report_date": latest_date,
+        "items": items,
+        "source": "eastmoney_f10_business",
+    }
+
+
+def parse_announcements(payload: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    notices = ((payload.get("data") or {}).get("list") or [])[:limit]
+    rows = []
+    for item in notices:
+        title = clean_text(item.get("title_ch") or item.get("title") or "")
+        if not title:
+            continue
+        columns = item.get("columns") or []
+        rows.append(
+            {
+                "title": title,
+                "date": normalize_date(item.get("notice_date") or item.get("display_time")),
+                "source": "东方财富公告",
+                "category": "、".join(clean_text(col.get("column_name")) for col in columns if col.get("column_name")),
+                "url": f"https://data.eastmoney.com/notices/detail/{item.get('art_code')}.html" if item.get("art_code") else "",
+            }
+        )
+    return rows
+
+
+def parse_news_search(payload: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    raw_items = (
+        payload.get("Data")
+        or payload.get("data")
+        or payload.get("result")
+        or payload.get("items")
+        or []
+    )
+    if isinstance(raw_items, dict):
+        raw_items = raw_items.get("Items") or raw_items.get("List") or raw_items.get("list") or []
+    rows = []
+    for item in raw_items[:limit]:
+        title = clean_text(item.get("Title") or item.get("title") or item.get("Art_Title") or "")
+        if not title:
+            continue
+        rows.append(
+            {
+                "title": title,
+                "date": normalize_date(item.get("ShowTime") or item.get("date") or item.get("PublishTime")),
+                "source": clean_text(item.get("Source") or item.get("source") or "东方财富新闻"),
+                "url": clean_text(item.get("Url") or item.get("url") or ""),
+            }
+        )
+    return rows
+
+
+def get_company_survey(symbol: str) -> dict[str, Any]:
+    normalized = normalize_symbol(symbol)
+    cache_key = f"company-survey:{normalized}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    url = EASTMONEY_COMPANY_SURVEY_URL + "?" + urllib.parse.urlencode({"code": eastmoney_f10_code(normalized)})
+    text = request_text(url, referer="https://emweb.securities.eastmoney.com/", timeout=10)
+    result = parse_company_survey(json.loads(text), normalized)
+    cache.set(cache_key, result, COMPANY_PROFILE_TTL_SECONDS)
+    return result
+
+
+def get_business_analysis(symbol: str) -> dict[str, Any]:
+    normalized = normalize_symbol(symbol)
+    cache_key = f"business-analysis:{normalized}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    url = EASTMONEY_BUSINESS_ANALYSIS_URL + "?" + urllib.parse.urlencode({"code": eastmoney_f10_code(normalized)})
+    text = request_text(url, referer="https://emweb.securities.eastmoney.com/", timeout=10)
+    result = parse_business_analysis(json.loads(text))
+    cache.set(cache_key, result, BUSINESS_ANALYSIS_TTL_SECONDS)
+    return result
+
+
+def get_stock_announcements(symbol: str, limit: int = 5) -> list[dict[str, Any]]:
+    normalized = normalize_symbol(symbol)
+    cache_key = f"announcements:{normalized}:{limit}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    params = {
+        "sr": "-1",
+        "page_size": str(limit),
+        "page_index": "1",
+        "ann_type": "A",
+        "client_source": "web",
+        "stock_list": announcement_stock_code(normalized),
+    }
+    url = EASTMONEY_ANNOUNCEMENT_URL + "?" + urllib.parse.urlencode(params)
+    text = request_text(url, referer="https://data.eastmoney.com/", timeout=10)
+    result = parse_announcements(json.loads(text), limit=limit)
+    cache.set(cache_key, result, CATALYST_TTL_SECONDS)
+    return result
+
+
+def get_stock_news(symbol: str, name: str, limit: int = 5) -> list[dict[str, Any]]:
+    if not name:
+        return []
+    normalized = normalize_symbol(symbol)
+    cache_key = f"stock-news:{normalized}:{limit}:{name}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    params = {
+        "type": "401",
+        "pageindex": "1",
+        "pagesize": str(limit),
+        "keyword": name,
+        "name": "normal",
+    }
+    url = EASTMONEY_SEARCH_NEWS_URL + "?" + urllib.parse.urlencode(params)
+    try:
+        text = request_text(url, referer="https://so.eastmoney.com/", timeout=8)
+        result = parse_news_search(json.loads(text), limit=limit)
+    except Exception:
+        result = []
+    cache.set(cache_key, result, CATALYST_TTL_SECONDS)
+    return result
+
+
+def price_volume_stats(daily: dict[str, Any]) -> dict[str, Any]:
+    points = daily.get("points") or []
+    if len(points) < 2:
+        return {"return_5d": None, "return_10d": None, "return_20d": None, "volume_ratio_20d": None}
+    latest = points[-1]
+
+    def ret(days: int) -> float | None:
+        if len(points) <= days:
+            return None
+        base = points[-days - 1].get("close")
+        close = latest.get("close")
+        if not base or not close:
+            return None
+        return round((close - base) / base * 100, 2)
+
+    recent_volumes = [float(p.get("volume") or 0) for p in points[-21:-1]]
+    avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 0
+    latest_volume = float(latest.get("volume") or 0)
+    volume_ratio = round(latest_volume / avg_volume, 2) if avg_volume else None
+    return {
+        "return_5d": ret(5),
+        "return_10d": ret(10),
+        "return_20d": ret(20),
+        "volume_ratio_20d": volume_ratio,
+    }
+
+
+def catalyst_strength(title: str, source: str) -> str:
+    strong_words = ["业绩", "预增", "订单", "合同", "回购", "重组", "中标", "获批", "定增", "收购"]
+    medium_words = ["合作", "产品", "政策", "涨价", "扩产", "产业", "景气", "板块", "概念"]
+    if source == "公告" and any(word in title for word in strong_words):
+        return "强"
+    if any(word in title for word in strong_words + medium_words):
+        return "中"
+    return "弱"
+
+
+def choose_catalysts(
+    announcements: list[dict[str, Any]],
+    news: list[dict[str, Any]],
+    price_stats: dict[str, Any],
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    catalysts: list[dict[str, Any]] = []
+    for item in announcements:
+        title = clean_text(item.get("title"))
+        if not title:
+            continue
+        catalysts.append(
+            {
+                "title": title,
+                "date": item.get("date") or "",
+                "source": "公告",
+                "strength": catalyst_strength(title, "公告"),
+                "note": "公司公告优先级最高，可作为核验上涨线索的主要证据。",
+                "url": item.get("url") or "",
+            }
+        )
+    for item in news:
+        title = clean_text(item.get("title"))
+        if not title:
+            continue
+        catalysts.append(
+            {
+                "title": title,
+                "date": item.get("date") or "",
+                "source": item.get("source") or "新闻",
+                "strength": catalyst_strength(title, "新闻"),
+                "note": "新闻只作为线索，需要回到公告、财报或行业数据进一步确认。",
+                "url": item.get("url") or "",
+            }
+        )
+    if not catalysts:
+        r5 = price_stats.get("return_5d")
+        volume_ratio = price_stats.get("volume_ratio_20d")
+        if r5 is not None and abs(r5) >= 5:
+            title = f"近 5 日涨跌幅 {r5}%，最新量能约为 20 日均量 {volume_ratio or '-'} 倍"
+            note = "未找到明确公告或新闻催化，更像价格量能推动，需要防止题材解释后验化。"
+        else:
+            title = "未找到明确公开催化"
+            note = "当前公开信息不足，先按技术面和资金面线索观察。"
+        catalysts.append(
+            {
+                "title": title,
+                "date": "",
+                "source": "价格量能",
+                "strength": "弱",
+                "note": note,
+                "url": "",
+            }
+        )
+    strength_order = {"强": 0, "中": 1, "弱": 2}
+    catalysts.sort(key=lambda item: (strength_order.get(item.get("strength"), 9), 0 if item.get("source") == "公告" else 1))
+    return catalysts[:limit]
+
+
+def build_analyst_notes(
+    snapshot: dict[str, Any] | None,
+    profile: dict[str, Any] | None,
+    business: dict[str, Any] | None,
+    catalysts: list[dict[str, Any]],
+    price_stats: dict[str, Any],
+) -> list[str]:
+    fundamentals = snapshot or {}
+    notes = []
+    industry = (profile or {}).get("industry") or "行业信息暂缺"
+    notes.append(f"公司所处行业：{industry}；上涨线索需和主营业务、公告或行业景气交叉验证。")
+    if business and business.get("items"):
+        top = business["items"][0]
+        ratio = top.get("income_ratio_pct")
+        notes.append(f"最近一期收入占比最高的是“{top.get('name')}”{f'，约 {ratio}%' if ratio is not None else ''}，催化若不在核心业务上，持续性要打折。")
+    else:
+        notes.append("主营构成暂缺，暂时无法判断催化是否真正落在核心收入来源。")
+    pe = fundamentals.get("pe_dynamic")
+    pb = fundamentals.get("pb")
+    turnover = fundamentals.get("turnover")
+    if pe and pe > 80:
+        notes.append("动态市盈率偏高，若催化没有业绩兑现，高估值会放大回撤风险。")
+    elif pe:
+        notes.append(f"动态市盈率约 {pe}，仍需和行业估值、利润增速一起看。")
+    if pb and pb > 8:
+        notes.append("市净率偏高，说明市场已给较高预期，追高容错率较低。")
+    if turnover and turnover > 12:
+        notes.append("换手率偏高，短线资金博弈较强，催化失效时波动可能放大。")
+    if catalysts and catalysts[0].get("source") == "公告":
+        notes.append("当前最强线索来自公告，优先核对公告正文里的时间、金额和执行条件。")
+    elif catalysts and catalysts[0].get("source") == "价格量能":
+        notes.append("暂未发现明确公开催化，本轮更偏技术面或资金推动，不宜把原因解释得过满。")
+    r20 = price_stats.get("return_20d")
+    if r20 is not None and r20 > 25:
+        notes.append(f"近 20 日涨幅约 {r20}%，已不属于低位启动，需重点看回撤承受位。")
+    return notes[:6]
+
+
+def build_fundamental_story(
+    symbol: str,
+    snapshot: dict[str, Any] | None,
+    daily: dict[str, Any],
+    profile: dict[str, Any] | None = None,
+    business: dict[str, Any] | None = None,
+    announcements: list[dict[str, Any]] | None = None,
+    news: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    fundamentals = snapshot or {}
+    profile = profile or {}
+    business = business or {}
+    price_stats = price_volume_stats(daily)
+    catalysts = choose_catalysts(announcements or [], news or [], price_stats)
+    profile_items = [
+        {"label": "公司全称", "value": profile.get("full_name") or fundamentals.get("name") or normalize_symbol(symbol).upper()},
+        {"label": "所属行业", "value": profile.get("industry") or "-"},
+        {"label": "上市地点", "value": profile.get("market") or "-"},
+        {"label": "上市时间", "value": profile.get("listing_date") or "-"},
+        {"label": "员工人数", "value": profile.get("employees")},
+        {"label": "官网", "value": profile.get("website") or "-"},
+    ]
+    valuation_items = [
+        {"label": "总市值", "value": fundamentals.get("market_cap")},
+        {"label": "流通市值", "value": fundamentals.get("float_market_cap")},
+        {"label": "动态市盈率", "value": fundamentals.get("pe_dynamic")},
+        {"label": "市净率", "value": fundamentals.get("pb")},
+        {"label": "换手率", "value": fundamentals.get("turnover"), "suffix": "%"},
+        {"label": "成交额", "value": fundamentals.get("amount")},
+    ]
+    return {
+        "profile": {
+            "title": "公司画像",
+            "summary": profile.get("intro") or "公司简介暂缺，先以交易快照和公开公告做基础核验。",
+            "items": profile_items,
+            "source": profile.get("source") or "",
+        },
+        "business_mix": {
+            "title": "收入结构",
+            "summary": f"报告期 {business.get('report_date')}" if business.get("report_date") else "主营构成暂缺",
+            "business_scope": business.get("business_scope") or "",
+            "items": business.get("items") or [],
+            "source": business.get("source") or "",
+        },
+        "catalysts": catalysts,
+        "price_stats": price_stats,
+        "analyst_notes": build_analyst_notes(snapshot, profile, business, catalysts, price_stats),
+        "valuation_items": valuation_items,
+    }
 
 
 def get_market_spot_universe(page_size: int = 80) -> dict[str, Any]:
@@ -892,6 +1298,7 @@ def build_detail_analysis(
     confirmation: dict[str, Any],
     quote: dict[str, Any] | None,
     snapshot: dict[str, Any] | None,
+    fundamental_story: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     points = daily.get("points") or []
     latest = points[-1] if points else {}
@@ -936,6 +1343,8 @@ def build_detail_analysis(
         {"label": "换手率", "value": fundamentals.get("turnover"), "suffix": "%"},
         {"label": "成交额", "value": fundamentals.get("amount")},
     ]
+    story_symbol = fundamentals.get("symbol") or "sh000001"
+    story = fundamental_story or build_fundamental_story(story_symbol, snapshot, daily)
     positive = []
     if signal.get("status") == "buy_watch":
         positive.append("日线形态满足买入观察条件，适合继续看盘中确认。")
@@ -974,10 +1383,15 @@ def build_detail_analysis(
             "positives": positive,
         },
         "fundamental": {
-            "title": "基本面",
-            "summary": "来自东方财富个股快照；财报质量、行业景气和公告仍需进一步核验。",
-            "items": fundamental_items,
+            "title": "基本面与催化",
+            "summary": "公司画像、主营结构和公开催化的证据型核验，不把线索直接当确定因果。",
+            "items": story.get("valuation_items") or fundamental_items,
             "source": fundamentals.get("source") if fundamentals else "",
+            "profile": story.get("profile") or {},
+            "business_mix": story.get("business_mix") or {},
+            "catalysts": story.get("catalysts") or [],
+            "price_stats": story.get("price_stats") or {},
+            "analyst_notes": story.get("analyst_notes") or [],
         },
         "risk": {
             "title": "风险与验证",
@@ -1348,11 +1762,41 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
                 intraday = get_intraday_kline(symbol, period)
                 quote = quotes[0] if quotes else None
                 snapshot = None
-                snapshot_warning = ""
+                warning_parts = []
                 try:
                     snapshot = get_stock_snapshot(symbol)
                 except Exception as exc:
-                    snapshot_warning = str(exc)
+                    warning_parts.append(f"估值快照：{exc}")
+                profile = None
+                business = None
+                announcements: list[dict[str, Any]] = []
+                news: list[dict[str, Any]] = []
+                try:
+                    profile = get_company_survey(symbol)
+                except Exception as exc:
+                    warning_parts.append(f"公司画像：{exc}")
+                try:
+                    business = get_business_analysis(symbol)
+                except Exception as exc:
+                    warning_parts.append(f"主营构成：{exc}")
+                try:
+                    announcements = get_stock_announcements(symbol)
+                except Exception as exc:
+                    warning_parts.append(f"公告：{exc}")
+                try:
+                    news_name = (profile or {}).get("name") or (snapshot or {}).get("name") or daily.get("name") or ""
+                    news = get_stock_news(symbol, news_name)
+                except Exception as exc:
+                    warning_parts.append(f"新闻：{exc}")
+                fundamental_story = build_fundamental_story(
+                    symbol,
+                    snapshot,
+                    daily,
+                    profile=profile,
+                    business=business,
+                    announcements=announcements,
+                    news=news,
+                )
                 confirmation = intraday_confirmation(signal, intraday, quote)
                 json_response(
                     self,
@@ -1362,10 +1806,19 @@ class StockSiteHandler(SimpleHTTPRequestHandler):
                         "daily": daily,
                         "intraday": intraday,
                         "fundamental": snapshot,
-                        "fundamental_warning": snapshot_warning,
+                        "fundamental_story": fundamental_story,
+                        "fundamental_warning": "；".join(warning_parts),
                         "signal": signal,
                         "confirmation": confirmation,
-                        "analysis": build_detail_analysis(daily, signal, intraday, confirmation, quote, snapshot),
+                        "analysis": build_detail_analysis(
+                            daily,
+                            signal,
+                            intraday,
+                            confirmation,
+                            quote,
+                            snapshot,
+                            fundamental_story,
+                        ),
                     },
                 )
             elif parsed.path == "/api/universe":

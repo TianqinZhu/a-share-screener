@@ -477,6 +477,77 @@ tbody tr.selected {
   line-height: 1.65;
 }
 
+.story-section {
+  display: grid;
+  gap: 8px;
+  padding-top: 10px;
+  margin-top: 10px;
+  border-top: 1px solid #eef2f6;
+}
+
+.story-section:first-of-type {
+  padding-top: 0;
+  margin-top: 0;
+  border-top: 0;
+}
+
+.story-section h4 {
+  margin: 0;
+  color: #344054;
+  font-size: 13px;
+}
+
+.story-copy,
+.empty-mini {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.mix-list,
+.catalyst-list {
+  display: grid;
+  gap: 8px;
+}
+
+.mix-row,
+.catalyst-card {
+  border: 1px solid #edf1f7;
+  border-radius: 8px;
+  padding: 8px;
+  background: #fbfcfe;
+}
+
+.mix-row strong,
+.catalyst-card strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.mix-row span,
+.catalyst-meta,
+.catalyst-card p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.catalyst-card p {
+  margin: 4px 0 0;
+}
+
+.catalyst-card a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.catalyst-card a:hover {
+  text-decoration: underline;
+}
+
 .data-note {
   margin-top: 10px;
 }

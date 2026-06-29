@@ -51,7 +51,7 @@ function formatAmount(value) {
 function formatMetricValue(item) {
   const value = item?.value;
   if (value === null || value === undefined || value === "") return "暂缺";
-  if (["总市值", "流通市值", "成交额"].includes(item.label)) return formatAmount(value);
+  if (["总市值", "流通市值", "成交额", "收入"].includes(item.label)) return formatAmount(value);
   if (typeof value === "number") return `${formatNumber(value)}${item.suffix || ""}`;
   return `${value}${item.suffix || ""}`;
 }
@@ -277,20 +277,69 @@ function renderList(targetId, items = []) {
   target.innerHTML = list.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
 }
 
+function renderBusinessMix(targetId, items = [], summary = "") {
+  const target = $(targetId);
+  if (!items.length) {
+    target.innerHTML = `<div class="empty-mini">${escapeHtml(summary || "主营构成暂缺")}</div>`;
+    return;
+  }
+  target.innerHTML = items
+    .map((item) => {
+      const ratio = item.income_ratio_pct === null || item.income_ratio_pct === undefined ? "-" : `${formatNumber(item.income_ratio_pct)}%`;
+      const margin = item.gross_margin_pct === null || item.gross_margin_pct === undefined ? "-" : `${formatNumber(item.gross_margin_pct)}%`;
+      return `
+        <div class="mix-row">
+          <strong>${escapeHtml(item.name || "-")}</strong>
+          <span>收入占比 ${escapeHtml(ratio)} · 毛利率 ${escapeHtml(margin)}</span>
+        </div>`;
+    })
+    .join("");
+}
+
+function renderCatalysts(targetId, catalysts = []) {
+  const target = $(targetId);
+  if (!catalysts.length) {
+    target.innerHTML = `<div class="empty-mini">未找到明确公开催化</div>`;
+    return;
+  }
+  target.innerHTML = catalysts
+    .map((item) => {
+      const meta = [item.date, item.source, item.strength ? `${item.strength}证据` : ""].filter(Boolean).join(" · ");
+      const title = item.url
+        ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title || "-")}</a>`
+        : escapeHtml(item.title || "-");
+      return `
+        <article class="catalyst-card">
+          <div class="catalyst-meta">${escapeHtml(meta || "公开线索")}</div>
+          <strong>${title}</strong>
+          <p>${escapeHtml(item.note || "")}</p>
+        </article>`;
+    })
+    .join("");
+}
+
 function renderAnalysis(data) {
   const analysis = data.analysis || {};
   const technical = analysis.technical || {};
   const fundamental = analysis.fundamental || {};
   const risk = analysis.risk || {};
+  const profile = fundamental.profile || {};
+  const businessMix = fundamental.business_mix || {};
   $("technicalSummary").textContent = technical.summary || "暂无技术面结论";
   $("fundamentalSummary").textContent = fundamental.summary || "基本面字段暂缺";
+  $("companyProfileSummary").textContent = profile.summary || "公司简介暂缺，先以公开公告和估值快照做基础核验。";
+  $("businessScope").textContent = businessMix.business_scope || businessMix.summary || "主营业务说明暂缺。";
   renderKeyValues("technicalList", technical.items || []);
+  renderKeyValues("companyProfileList", profile.items || []);
   renderKeyValues("fundamentalList", fundamental.items || []);
+  renderBusinessMix("businessMixList", businessMix.items || [], businessMix.summary || "");
+  renderCatalysts("catalystList", fundamental.catalysts || []);
+  renderList("analystNotes", fundamental.analyst_notes || []);
   renderList("technicalPositives", technical.positives || []);
   renderList("riskList", risk.items || []);
   $("fundamentalWarning").textContent = data.fundamental_warning
     ? `基本面数据源提示：${data.fundamental_warning}`
-    : "估值字段为交易软件快照口径，仍需结合财报、行业和公告核验。";
+    : "上涨原因仅按公告、新闻、主营和量价做证据归纳，不构成确定因果或投资建议。";
 }
 
 function yScale(min, max, top, bottom) {
